@@ -1,63 +1,69 @@
 /*
-    EsphostedBtGlue.cpp - core<->driver glue for ESP-Hosted Bluetooth
+   EsphostedBtGlue.cpp - driver-side glue for ESP-Hosted Bluetooth
 
-    Registers the CEspControl entry points the arduino-pico core needs to
-    drive Bluetooth HCI over the ESP-Hosted link (see
-    cores/rp2040/esphosted_bt.{h,cpp}).
+   Registers the CEspControl entry points a host core needs to drive
+   Bluetooth HCI over the ESP-Hosted link (see EsphostedBtGlue.h for the
+   core<->driver contract).
 
-    This object lives in the ESPHost library on purpose: the core must not
-    reference CEspControl directly, because a sketch that uses neither WiFi
-    nor BLE never links this library and would fail to link.  The core only
-    calls through the ops table below; this file is pulled into the link by
-    esphostedBtGlueInstall() calls from BLE.begin()/BluetoothHCI::begin() and
-    the WiFi driver's initHW() -- i.e. exactly when the driver is present.
+   This object lives in the ESPHost library on purpose: the core must not
+   reference CEspControl directly, because a sketch that uses neither WiFi
+   nor BLE never links this library and would fail to link.  The core only
+   calls through the ops table; this file is pulled into the link by
+   esphostedBtGlueInstall() calls from the core - i.e. exactly when the
+   driver is present.  The glue itself is core agnostic: the only
+   platform-specific part is the link lock taken during bring-up, see
+   esphostedBtLinkLock below.
 
-    Copyright (c) 2026 Pontus Oldberg
+   Copyright (c) 2026 Pontus Oldberg
 
-    This library is free software; you can redistribute it and/or
-    modify it under the terms of the GNU Lesser General Public
-    License as published by the Free Software Foundation; either
-    version 2.1 of the License, or (at your option) any later version.
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public
+   License as published by the Free Software Foundation; either
+   version 2.1 of the License, or (at your option) any later version.
 
-    This library is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-    Lesser General Public License for more details.
+   This library is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+   Lesser General Public License for more details.
 
-    You should have received a copy of the GNU Lesser General Public
-    License along with this library; if not, write to the Free Software
-    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+   You should have received a copy of the GNU Lesser General Public
+   License along with this library; if not, write to the Free Software
+   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 */
 
 #ifdef ESPHOST_BT
 
 #include <Arduino.h>
 #include "CEspControl.h"
+#include "EsphostedBtGlue.h"
 
-// Core hooks (cores/rp2040/esphosted_bt.h; declared here so this library
-// does not need the btstack headers that header pulls in).
-extern "C" {
-typedef struct esphostedHciOps {
-    bool (*bringUp)(void);
-    void (*pump)(void);
-    int (*sendHci)(uint8_t packetType, uint8_t *packet, uint16_t size);
-    uint16_t (*getHciRx)(uint8_t *packetType, uint8_t *buf, uint16_t bufsize);
-} esphostedHciOps;
-void esphostedBtRegisterOps(const esphostedHciOps *ops);
-}
+/* Locking during glue bring-up: every pass into the driver must hold the
+   core's link lock so other execution contexts (handshake GPIO IRQ,
+   background servicing, other RTOS tasks) never run inside the driver
+   concurrently.  The seam is per platform:
 
-// The core's link lock: every pass into the driver must hold it so the
-// DATA_READY GPIO IRQ and the lwIP background pump never run inside the
-// driver concurrently with BTstack servicing.  Under FreeRTOS that lock is
-// the core's shared recursive BT/link mutex (LWIPMutex is a no-op there);
-// see cores/rp2040/esphosted_bt.h.
+   - arduino-pico, no-OS: the async LWIP mutex (a core header), taken RAII
+     style, is the lock.
+   - everything else: the optional core hooks esphostedBtLock/Unlock, weak
+     references so cores without them (single context, or no Bluetooth core
+     side at all) link fine and run unlocked. */
+#if defined(ARDUINO_ARCH_RP2040) && !defined(ARDUINO_ARCH_MBED) && !defined(__FREERTOS)
 #include <lwip_wrap.h>
-#ifdef __FREERTOS
+#else
 extern "C" {
-void esphostedBtLock(void);
-void esphostedBtUnlock(void);
+__attribute__((weak)) void esphostedBtLock(void);
+__attribute__((weak)) void esphostedBtUnlock(void);
 }
 #endif
+
+struct esphostedBtLinkLock {
+#if defined(ARDUINO_ARCH_RP2040) && !defined(ARDUINO_ARCH_MBED) && !defined(__FREERTOS)
+    LWIPMutex m;
+#else
+    esphostedBtLinkLock()  { if (esphostedBtLock)   esphostedBtLock(); }
+    ~esphostedBtLinkLock() { if (esphostedBtUnlock) esphostedBtUnlock(); }
+#endif
+};
 
 static volatile bool s_linkUp = false;
 
@@ -81,14 +87,8 @@ static bool glueBringUp(void) {
     uint32_t start = millis();
     while (!s_linkUp && (millis() - start < 10000)) {
         {
-#ifdef __FREERTOS
-            esphostedBtLock();
+            esphostedBtLinkLock lk;
             CEspControl::getInstance().communicateWithEsp();
-            esphostedBtUnlock();
-#else
-            LWIPMutex m;
-            CEspControl::getInstance().communicateWithEsp();
-#endif
         }
         delay(100);
     }
